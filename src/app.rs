@@ -336,9 +336,14 @@ pub fn perform(cfg: &Config, picked: &Picked, target: &Target, cwd: Option<&str>
 
 /// The float overlay: this process owns a terminal that covers the pane.
 pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Result<(), String> {
-    let patterns = patterns::build(cfg.patterns.as_deref(), &cfg.extra)?;
-    let size = target.size()?;
-    let vt = target.capture_vt()?;
+    // Capture while compiling patterns and fetching the size; neither needs the captured text.
+    let (patterns, size, vt) = std::thread::scope(|scope| {
+        let capture = scope.spawn(|| target.capture_vt());
+        let patterns = patterns::build(cfg.patterns.as_deref(), &cfg.extra)?;
+        let size = target.size()?;
+        let vt = capture.join().map_err(|_| "capture task panicked".to_string())??;
+        Ok::<_, String>((patterns, size, vt))
+    })?;
     let loaded = Loaded::new(&vt, size.columns, size.rows, cfg.scrollback, &patterns);
     let total = loaded.screen.rows.len();
     let mut overlay = overlay(mode, &loaded, cfg);
