@@ -18,6 +18,8 @@ pub struct Config {
     pub shift_action: String,
     pub ctrl_action: String,
     pub alt_action: String,
+    /// Open recognized source files in this Neovim executable; None retains macOS Open.
+    pub nvim: Option<String>,
     /// SGR parameters, e.g. "1;38;5;0;48;5;12".
     pub hint_style: String,
     pub highlight_style: String,
@@ -39,6 +41,7 @@ impl Default for Config {
             shift_action: ":paste:".into(),
             ctrl_action: ":open:".into(),
             alt_action: String::new(),
+            nvim: None,
             hint_style: "1;38;5;0;48;5;12".into(),
             highlight_style: "1;38;5;12".into(),
             dim: false,
@@ -68,6 +71,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.nvim.as_ref().is_some_and(|path| path.is_empty() || path.chars().any(char::is_control)) {
+            return Err("nvim must be a nonempty executable name or path without control characters".into());
+        }
         if self.hint_position != "left" && self.hint_position != "right" {
             return Err(format!(
                 "config: hint_position must be \"left\" or \"right\", got {:?}",
@@ -107,6 +113,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvim_is_optional_and_rejects_empty_or_control_character_paths() {
+        assert!(Config::default().nvim.is_none());
+        assert_eq!(Config::from_json(r#"{"nvim":"/opt/homebrew/bin/nvim"}"#).unwrap().nvim.as_deref(), Some("/opt/homebrew/bin/nvim"));
+        for json in [r#"{"nvim":""}"#, r#"{"nvim":"bad\npath"}"#] {
+            assert!(Config::from_json(json).is_err());
+        }
+    }
 
     #[test]
     fn empty_object_gives_the_defaults() {

@@ -10,6 +10,7 @@ mod config;
 mod flash;
 mod hints;
 mod input;
+mod open;
 mod patterns;
 mod render;
 mod rex;
@@ -80,6 +81,9 @@ fn main() {
     if let Err(e) = &result {
         show_error(e);
     }
-    args.target.focus();
+    match &result {
+        Ok(Some(editor)) => editor.focus(),
+        _ => args.target.focus(),
+    }
     std::process::exit(i32::from(result.is_err()));
 }

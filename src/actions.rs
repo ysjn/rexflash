@@ -3,26 +3,30 @@
 //! Screen text only ever travels as stdin or as one argv element. It is never put into a shell string.
 //! The only shell string is a command from the config.
 
+use crate::config::Config;
 use crate::input::Modifier;
 use crate::rex::Target;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 pub fn perform(
-    action: &str,
+    cfg: &Config,
     text: &str,
     is_uri: bool,
     modifier: Modifier,
     hint: &str,
     target: &Target,
     cwd: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Option<Target>, String> {
     copy(text)?;
-    match action {
-        "" | ":copy:" => Ok(()),
-        ":paste:" => target.write(text),
-        ":open:" => open(text, cwd, is_uri),
-        command => run_command(command, text, modifier, hint, cwd),
+    match cfg.action(modifier) {
+        "" | ":copy:" => Ok(None),
+        ":paste:" => target.write(text).map(|_| None),
+        ":open:" => match cfg.nvim.as_deref() {
+            Some(nvim) => crate::open::selection(text, target, cwd, nvim),
+            None => open(text, cwd, is_uri).map(|_| None),
+        },
+        command => run_command(command, text, modifier, hint, cwd).map(|_| None),
     }
 }
 

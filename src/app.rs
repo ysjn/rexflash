@@ -334,12 +334,12 @@ fn io_err(e: io::Error) -> String {
 }
 
 /// Runs the action of a pick: copy first, then paste, open or the configured command.
-pub fn perform(cfg: &Config, picked: &Picked, target: &Target, cwd: Option<&str>) -> Result<(), String> {
-    actions::perform(cfg.action(picked.modifier), &picked.text, picked.is_uri, picked.modifier, &picked.hint, target, cwd)
+pub fn perform(cfg: &Config, picked: &Picked, target: &Target, cwd: Option<&str>) -> Result<Option<Target>, String> {
+    actions::perform(cfg, &picked.text, picked.is_uri, picked.modifier, &picked.hint, target, cwd)
 }
 
 /// The float overlay: this process owns a terminal that covers the pane.
-pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Result<(), String> {
+pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Result<Option<Target>, String> {
     // Capture while compiling patterns and fetching the size; neither needs the captured text.
     let (patterns, size, vt) = std::thread::scope(|scope| {
         let capture = scope.spawn(|| target.capture_vt());
@@ -381,7 +381,7 @@ pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Resu
 
     match picked {
         Some(p) => perform(cfg, &p, target, cwd),
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 

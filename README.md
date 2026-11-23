@@ -105,6 +105,15 @@ live screen.
 `:open:` runs macOS `open` on the match. For `src/main.rs:42:5` it opens `src/main.rs`. `~/` is
 expanded, and relative paths resolve against the working directory of the pane.
 
+Set `nvim = "/path/to/nvim"` to open recognized source/config files in a new
+Neovim pane to the left instead. MIME checks exclude binary files; ordinary
+text/Markdown, directories, images other than SVG, and URLs retain macOS Open.
+Paths with `:line[:column]` or `#Lline[Ccolumn]`, and local `file://` URIs,
+preserve their location in Neovim. Existing filenames take precedence over
+location suffixes. The editor keeps focus after the overlay closes; other
+actions and cancellation return to the source pane. Without `nvim`, Open keeps
+its existing behavior. This runs entirely in Rust and needs no Node wrapper.
+
 **OSC 8 hyperlinks**
 
 Hint mode labels the visible link text; picking it copies, pastes or opens its destination URI.
@@ -112,7 +121,8 @@ Flash mode searches the visible text and uses the destination when the selected 
 one hyperlink. Hyperlinks are recognized independently of the `patterns` option and take precedence
 over overlapping regex matches. They work across wrapped rows, and repeated destinations share a
 hint label. Destinations must be absolute URIs without whitespace or control characters; other OSC
-sequences are ignored. Opening a hyperlink passes its URI unchanged to macOS `open`.
+sequences are ignored. Opening a hyperlink passes its URI unchanged to macOS
+`open`, except local source-file URIs when `nvim` is configured.
 
 ## Patterns
 
@@ -183,6 +193,7 @@ dofile("/opt/homebrew/opt/rexflash/share/rexflash/rexflash.lua") {
 | `dim`                                           | `false`                       | Dim the text that is not a match |
 | `scrollback`                                    | `2000`                        | Rows of history to capture |
 | `bin`                                           | Homebrew binary               | Path to the `rexflash` binary |
+| `nvim`                                          | none                          | Optional Neovim executable; Open uses a new pane for recognized source files |
 | `theme`                                         | Rex default                   | Theme of the overlay terminal |
 
 An action is one of:
@@ -199,10 +210,11 @@ An action is one of:
 1. The Lua extension starts the `rexflash` binary in a floating terminal over the focused pane.
 2. The binary asks Rex for the pane text with `rex capture` and for its size with `rex block call`.
 3. It finds matches, draws the capture with labels, and reads the keys itself.
-4. After a pick it runs the action, closes, and focuses the pane again. A paste uses `rex block call write`.
+4. After a pick it runs the action and closes, focusing the source pane or the new Neovim pane.
+   A paste uses `rex block call write`. Errors wait for a key inside the overlay; quick cancellation closes it immediately.
 
 The pane is never drawn on. The `rex` command is found through `REX_BIN`, then `PATH`, then
-`REX_BIN_DIR`, then the Rex app bundle in your home directory.
+`REX_BIN_DIR`, then `~/.local/bin`, then the Rex app bundle in your home directory.
 
 Rex draws a title bar and a border on every floating terminal, so the overlay is a little smaller than
 the pane.
@@ -212,9 +224,11 @@ the pane.
 ```sh
 cargo test
 cargo clippy --all-targets
+luajit tests/lua-launch.lua
 ```
 
-To use a local build, point `bin` at `target/release/rexflash`. See [docs/RELEASING.md](docs/RELEASING.md)
+To use a local build, load its `rexflash.lua` and point `bin` at the absolute path of
+`target/release/rexflash`. See [docs/RELEASING.md](docs/RELEASING.md)
 for how a release is made.
 
 ## License

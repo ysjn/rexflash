@@ -31,6 +31,7 @@
 --       dim = false,                     -- true dims the text that is not a match
 --       scrollback = 2000,               -- rows of history to capture above the screen (0 = none)
 --       bin = "/path/to/rexflash",       -- optional: the binary to run (default: the one Homebrew installed)
+--       nvim = "/path/to/nvim",          -- optional: Open recognized source files in a Neovim pane
 --       theme = { foreground = "#c0caf5", background = "#1a1b26" }, -- optional: theme of the float
 --   }
 
@@ -128,7 +129,8 @@ return function(opts)
                 layout = rex.layout.block {
                     flavor = TERMINAL .. ".shell",
                     label = LABEL,
-                    options = { command = argv, exit = { on_completion = true }, theme = opts.theme },
+                    -- Errors already wait for a key; quick cancellation should close the overlay too.
+                    options = { command = argv, shell = "none", exit = { on_completion = true, quick_exit_threshold_ms = 0 }, theme = opts.theme },
                 },
             }
             if err ~= nil then error(err, 0) end
