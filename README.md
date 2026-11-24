@@ -100,6 +100,15 @@ Page Up, Page Down, Up, Down, Home and End move through the captured history. On
 screen get labels. Rex does not report where you scrolled the pane, so the view always starts at the
 live screen.
 
+**Paste**
+
+`:paste:` sends a bracketed paste when the source terminal has enabled it, so the selected text
+arrives as one paste instead of individual key commands. Terminals without bracketed paste retain
+plain text input. With foreground Codex, a visible `Vim: Normal` footer also adds `i` before the
+paste to enter Insert mode. Insert mode, Vim-disabled Codex, and other programs receive no extra
+key. If Codex's Vim footer is hidden or unrecognized, its editing mode is left unchanged. Metadata
+lookup failures stop the paste instead of guessing the target's input mode.
+
 **Open**
 
 `:open:` runs macOS `open` on the match. For `src/main.rs:42:5` it opens `src/main.rs`. `~/` is
