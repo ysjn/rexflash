@@ -141,6 +141,11 @@ By default hint mode looks for all of these except `digit`:
 When matches overlap, the more specific pattern wins: a URL beats the path inside it, and `file-line` beats `path`. A match that wraps
 over two rows counts as one match.
 
+URLs hard-wrapped by TUIs such as Codex are also joined when they reach the pane's right edge and
+continue on an indented line. Screen positions are preserved in both Hint and Flash modes. This
+uses visible layout, so an intentional line break with the same layout can be ambiguous; explicit
+OSC 8 destinations take precedence.
+
 ## Options
 
 Pass them in the table you give to the function. A key that rexflash does not know is an error that

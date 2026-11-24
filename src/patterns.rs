@@ -5,6 +5,7 @@
 
 use crate::screen::Line;
 use regex::Regex;
+use unicode_width::UnicodeWidthChar;
 
 /// Extra test on a regex match, for rules a regex cannot express.
 type Check = fn(&str) -> bool;
@@ -14,6 +15,7 @@ pub struct Pattern {
     weight: u8,
     trim: bool,
     check: Option<Check>,
+    url: bool,
 }
 
 pub struct Found {
@@ -144,7 +146,7 @@ fn builtin(name: &str) -> Option<Pattern> {
         ),
         _ => return None,
     };
-    Some(Pattern { re: Regex::new(&src).expect("built-in pattern"), weight, trim, check })
+    Some(Pattern { re: Regex::new(&src).expect("built-in pattern"), weight, trim, check, url: name == "url" })
 }
 
 /// `names` selects built-ins; `None` selects `DEFAULT`. `extra` are user regexes. An unknown name is an error.
@@ -164,9 +166,54 @@ pub fn build(names: Option<&[String]>, extra: &[String]) -> Result<Vec<Pattern>,
     }
     for e in extra {
         let re = Regex::new(e).map_err(|err| format!("extra pattern {e:?}: {err}"))?;
-        out.push(Pattern { re, weight: 2, trim: false, check: None });
+        out.push(Pattern { re, weight: 2, trim: false, check: None, url: false });
     }
     Ok(out)
+}
+
+/// Restore indented TUI URL continuations without changing their screen coordinates.
+pub fn join_wrapped_urls(patterns: &[Pattern], lines: Vec<Line>, cols: usize) -> Vec<Line> {
+    let Some(url) = patterns.iter().find(|p| p.url) else { return lines };
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let text = line.text.trim_start_matches(' ');
+        let indent = line.text.len() - text.len();
+        let previous = out.last_mut().filter(|previous| {
+            // shortcut: Infer only indented hard wraps at the right edge; use TUI link metadata when available.
+            let at_edge = previous.pos.last().zip(previous.text.chars().last())
+                .is_some_and(|(&(_, col), ch)| col + ch.width().unwrap_or(0) == cols);
+            if indent < 2 || !at_edge || !previous.hyperlinks.is_empty() || !line.hyperlinks.is_empty() {
+                return false;
+            }
+            let Some(tail) = url.re.find_iter(&previous.text).last().filter(|m| m.end() == previous.text.len()) else {
+                return false;
+            };
+            if indent > previous.pos[previous.char_index(tail.start())].1
+                || url.re.find(text).is_some_and(|m| m.start() == 0)
+            {
+                return false;
+            }
+            let combined = format!("{}{text}", tail.as_str());
+            let Some(matched) = url.re.find(&combined) else { return false };
+            let added = matched.end() - tail.len();
+            if added == 0 {
+                return false;
+            }
+            let (fragment, suffix) = text.split_at(added);
+            suffix.trim().is_empty() || !suffix.starts_with(char::is_whitespace)
+                || fragment.contains(['/', '?', '#', '&', '=', '%'])
+                || tail.as_str().ends_with(['/', '?', '#', '&', '=', '%'])
+        });
+        if let Some(previous) = previous {
+            let offset = previous.text.len();
+            previous.text.push_str(text);
+            previous.byte.extend(line.byte[indent..].iter().map(|b| offset + b - indent));
+            previous.pos.extend_from_slice(&line.pos[indent..]);
+        } else {
+            out.push(line);
+        }
+    }
+    out
 }
 
 /// Finds hyperlinks and pattern matches. Hyperlinks take precedence over overlapping patterns;
@@ -354,6 +401,70 @@ mod tests {
         let found = find_all(&build(Some(&["url".to_string()]), &[]).unwrap(), &lines);
         assert_eq!(found[0].text, "https://example.com/x");
         assert_eq!(lines[0].pos[found[0].end - 1], (1, 8));
+    }
+
+    #[test]
+    fn tui_url_continuations_keep_unicode_and_screen_positions_across_three_rows() {
+        let screen = Screen::parse(concat!(
+            "\x1b[2C日本語 \x1b[32mhttps://example.com/abc\r\n",
+            "  abcdefghijklmnopqrstuvwxyz/123\r\n",
+            "  456?x=1&y=2\x1b[0m now\n",
+        ), 32);
+        let patterns = build(None, &[]).unwrap();
+        let lines = join_wrapped_urls(&patterns, screen.lines(), 32);
+        assert_eq!(screen.rows.len(), 3);
+        assert_eq!(lines.len(), 1);
+        let found = find_all(&patterns, &lines);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "https://example.com/abcabcdefghijklmnopqrstuvwxyz/123456?x=1&y=2");
+        assert_eq!(lines[0].pos[found[0].start], (0, 9));
+        let continuation = lines[0].char_index(lines[0].text.find("456").unwrap());
+        assert_eq!(lines[0].char_at(continuation), Some('4'));
+        assert_eq!(lines[0].pos[continuation], (2, 2));
+        assert_eq!(lines[0].byte.len(), lines[0].pos.len());
+    }
+
+    #[test]
+    fn tui_url_recovery_does_not_join_other_urls_prose_blank_lines_or_different_indents() {
+        let first = "  https://example.com/abc";
+        for next in [
+            "  https://other.example/path", "  next paragraph", "", "/separate/path",
+            "    /deeper/path", "  - another item", "  • another item",
+        ] {
+            let screen = Screen::parse(&format!("{first}\r\n{next}\r\nend\n"), first.len());
+            let lines = join_wrapped_urls(&build(None, &[]).unwrap(), screen.lines(), first.len());
+            assert_eq!(lines.len(), 3, "{next:?}");
+            assert_eq!(lines[0].text, first, "{next:?}");
+        }
+    }
+
+    #[test]
+    fn tui_url_recovery_requires_the_right_edge_and_an_enabled_url_pattern() {
+        let first = "  https://example.com/abc";
+        let vt = format!("{first}\r\n  /continued\n");
+        for (cols, names) in [
+            (first.len() + 1, vec!["url".to_string()]),
+            (first.len(), vec!["path".to_string()]),
+        ] {
+            let screen = Screen::parse(&vt, cols);
+            let lines = join_wrapped_urls(&build(Some(&names), &[]).unwrap(), screen.lines(), cols);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0].text, first);
+        }
+    }
+
+    #[test]
+    fn tui_url_recovery_preserves_explicit_hyperlinks() {
+        for vt in [
+            "  \x1b]8;;https://target.example/\x07https://example.com/abc\x1b]8;;\x07\r\n  /continued\n",
+            "  https://example.com/abc\r\n  \x1b]8;;https://target.example/\x07/continued\x1b]8;;\x07\n",
+        ] {
+            let screen = Screen::parse(vt, 25);
+            let patterns = build(None, &[]).unwrap();
+            let lines = join_wrapped_urls(&patterns, screen.lines(), 25);
+            assert_eq!(lines.len(), 2);
+            assert!(find_all(&patterns, &lines).iter().any(|f| f.is_uri && f.text == "https://target.example/"));
+        }
     }
 
     #[test]
