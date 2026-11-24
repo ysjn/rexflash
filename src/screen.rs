@@ -187,22 +187,35 @@ impl Screen {
     /// Rex joins rows with "\r\n" and adds a bare "\n" only when the last row is not empty.
     /// So a final "\r\n" means the last row is blank and stays; a final bare "\n" is only a terminator.
     pub fn parse(vt: &str, cols: usize) -> Screen {
+        Self::parse_from(vt, cols, 0)
+    }
+
+    /// Preserve escape state from old history without constructing its cells.
+    pub fn parse_tail(vt: &str, cols: usize, rows: usize) -> Screen {
+        let from = vt.rmatch_indices('\n').nth(rows).map_or(0, |(i, _)| i + 1);
+        Self::parse_from(vt, cols, from).tail(rows)
+    }
+
+    fn parse_from(vt: &str, cols: usize, from: usize) -> Screen {
         let vt = match vt.strip_suffix('\n') {
             Some(rest) if !rest.ends_with('\r') => rest,
             _ => vt,
         };
         let mut b = Builder::new(cols);
         let mut it = vt.chars();
+        let mut escaped_newline = false;
         while let Some(c) = it.next() {
+            let retain = vt.len() - it.as_str().len() > from;
             match c {
                 '\x1b' => match it.next() {
                     Some('[') => {
                         let mut params = String::new();
                         for n in it.by_ref() {
+                            escaped_newline |= n == '\n';
                             if ('\x40'..='\x7e').contains(&n) {
                                 match n {
                                     'm' => b.sgr(&params),
-                                    'C' => b.forward(&params),
+                                    'C' if retain => b.forward(&params),
                                     _ => {}
                                 }
                                 break;
@@ -214,6 +227,7 @@ impl Screen {
                         // OSC ends with BEL or ESC \.
                         let mut payload = String::new();
                         for n in it.by_ref() {
+                            escaped_newline |= n == '\n';
                             if n == '\x07' {
                                 b.osc(&payload);
                                 break;
@@ -226,17 +240,23 @@ impl Screen {
                             payload.push(n);
                         }
                     }
+                    Some('\n') => escaped_newline = true,
                     _ => {}
                 },
-                '\n' => b.newline(),
-                '\t' => {
+                '\n' if retain => b.newline(),
+                '\t' if retain => {
                     for _ in 0..(8 - b.row.len() % 8) {
                         b.put(' ');
                     }
                 }
                 c if c.is_control() => {}
-                c => b.put(c),
+                c if retain => b.put(c),
+                _ => {}
             }
+        }
+        // A newline consumed inside an escape cannot be used as a row boundary.
+        if from > 0 && escaped_newline {
+            return Self::parse(vt, cols);
         }
         b.finish()
     }
@@ -286,6 +306,34 @@ mod tests {
 
     fn row_text(s: &Screen, r: usize) -> String {
         s.rows[r].iter().filter(|c| c.width > 0).map(|c| c.ch).collect()
+    }
+
+    #[test]
+    fn parsing_only_retained_cells_matches_full_parsing() {
+        let cases = [
+            "\x1b[31mzero\none\ntwo\nthree\nfour\n",
+            "\x1b]8;;https://example.com/one\x07zero\none\ntwo\nthree\x1b]8;;\x07\nfour\n",
+            "\x1b]8;;file:///tmp/a\x1b\\日本語ab\n\twide日本語\n\x1b[3Cend\x1b]8;;\x1b\\\r\n",
+            "zero\n\x1b]8;;bad\nuri\x07one\ntwo\nthree\n",
+            "zero\n\x1b[1\n2mone\ntwo\nthree\n",
+            "zero\n\x1b\none\ntwo\nthree\n",
+            "zero\none\n\x1b]8;;https://unfinished\nignored",
+            "long wrapped line with 日本語 and tabs\tend\r\nlast\r\n",
+        ];
+        for vt in cases {
+            for cols in [4, 80] {
+                for keep in [0, 1, 2, 5, 100] {
+                    let full = Screen::parse(vt, cols).tail(keep);
+                    let limited = Screen::parse_tail(vt, cols, keep);
+                    let cells = |screen: &Screen| screen.rows.iter().map(|row| row.iter()
+                        .map(|c| (c.ch, c.width, c.style, c.hyperlink)).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    assert_eq!(cells(&limited), cells(&full), "{vt:?} cols={cols} keep={keep}");
+                    assert_eq!(limited.wrapped, full.wrapped);
+                    assert_eq!(limited.styles, full.styles);
+                    assert_eq!(limited.hyperlinks, full.hyperlinks);
+                }
+            }
+        }
     }
 
     #[test]

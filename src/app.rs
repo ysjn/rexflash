@@ -69,9 +69,12 @@ impl Loaded {
     /// `cols` and `pane_rows` are the size of the captured pane. Up to `scrollback` rows above its screen are kept.
     pub fn new(vt: &str, cols: usize, pane_rows: usize, scrollback: usize, patterns: &[Pattern]) -> Loaded {
         let keep = pane_rows + scrollback;
-        // OSC 8 state can start before the retained rows; ordinary captures can be trimmed first.
-        let vt = if vt.contains("\x1b]8;") { vt } else { tail_lines(vt, keep + 1) };
-        let screen = Screen::parse(vt, cols).tail(keep);
+        // OSC 8 state can start before retained rows; keep its escapes but skip old cells.
+        let screen = if vt.contains("\x1b]8;") {
+            Screen::parse_tail(vt, cols, keep)
+        } else {
+            Screen::parse(tail_lines(vt, keep + 1), cols).tail(keep)
+        };
         let live_top = screen.rows.len().saturating_sub(pane_rows);
         let lines = patterns::join_wrapped_urls(patterns, screen.lines(), cols);
         let found = patterns::find_all(patterns, &lines);
@@ -99,11 +102,11 @@ pub fn scrolled(top: usize, total: usize, rows: usize, scroll: Scroll) -> usize 
     new.min(max)
 }
 
-pub fn overlay<'a>(mode: Mode, loaded: &'a Loaded, cfg: &Config) -> Box<dyn Overlay + 'a> {
+pub fn overlay<'a>(mode: Mode, loaded: &'a Loaded, cfg: &Config, view: (usize, usize)) -> Box<dyn Overlay + 'a> {
     let alphabet = cfg.alphabet_chars();
     match mode {
-        Mode::Hint => Box::new(Hint::new(loaded, alphabet, cfg.hint_position == "right")),
-        Mode::Flash => Box::new(Flash { loaded, alphabet, query: String::new(), view: (0, usize::MAX) }),
+        Mode::Hint => Box::new(Hint::new(loaded, alphabet, cfg.hint_position == "right", view)),
+        Mode::Flash => Box::new(Flash { loaded, alphabet, query: String::new(), view }),
     }
 }
 
@@ -127,12 +130,12 @@ struct Hint<'a> {
 }
 
 impl<'a> Hint<'a> {
-    fn new(loaded: &'a Loaded, alphabet: Vec<char>, right: bool) -> Self {
+    fn new(loaded: &'a Loaded, alphabet: Vec<char>, right: bool, view: (usize, usize)) -> Self {
         let mut hint = Hint {
             loaded,
             alphabet,
             right,
-            view: (0, usize::MAX),
+            view,
             texts: Vec::new(),
             group_of: Vec::new(),
             labels: Vec::new(),
@@ -334,23 +337,30 @@ fn io_err(e: io::Error) -> String {
 }
 
 /// Runs the action of a pick: copy first, then paste, open or the configured command.
-pub fn perform(cfg: &Config, picked: &Picked, target: &Target, cwd: Option<&str>) -> Result<(), String> {
-    actions::perform(cfg.action(picked.modifier), &picked.text, picked.is_uri, picked.modifier, &picked.hint, target, cwd)
+pub fn perform(cfg: &Config, picked: &Picked, target: &Target, cwd: Option<&str>) -> Result<Option<Target>, String> {
+    actions::perform(cfg, &picked.text, picked.is_uri, picked.modifier, &picked.hint, target, cwd)
 }
 
 /// The float overlay: this process owns a terminal that covers the pane.
-pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Result<(), String> {
-    let patterns = patterns::build(cfg.patterns.as_deref(), &cfg.extra)?;
-    let size = target.size()?;
-    let vt = target.capture_vt()?;
+pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Result<Option<Target>, String> {
+    // Capture while compiling patterns and fetching the size; neither needs the captured text.
+    let (patterns, size, vt) = std::thread::scope(|scope| {
+        let capture = scope.spawn(|| target.capture_vt());
+        let patterns = patterns::build(cfg.patterns.as_deref(), &cfg.extra)?;
+        let size = target.size()?;
+        let vt = capture.join().map_err(|_| "capture task panicked".to_string())??;
+        Ok::<_, String>((patterns, size, vt))
+    })?;
     let loaded = Loaded::new(&vt, size.columns, size.rows, cfg.scrollback, &patterns);
     let total = loaded.screen.rows.len();
-    let mut overlay = overlay(mode, &loaded, cfg);
     let style = style(cfg, cfg.dim);
     let mut top = loaded.live_top;
 
     let picked = {
         let _guard = Guard::enter().map_err(io_err)?;
+        let (_, rows) = terminal::size().map_err(io_err)?;
+        top = top.min(total.saturating_sub(rows as usize));
+        let mut overlay = overlay(mode, &loaded, cfg, (top, rows as usize));
         let mut out = BufWriter::new(io::stdout());
         queue!(out, Clear(ClearType::All)).map_err(io_err)?;
         loop {
@@ -376,7 +386,7 @@ pub fn run(mode: Mode, target: &Target, cfg: &Config, cwd: Option<&str>) -> Resu
 
     match picked {
         Some(p) => perform(cfg, &p, target, cwd),
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 
@@ -412,7 +422,7 @@ mod tests {
     #[test]
     fn hint_label_picks_the_match() {
         let l = loaded("see https://example.com/a ok\n\n\n");
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         assert_eq!(
             pick(o.step(Key::Char('a', Modifier::Main))),
             ("https://example.com/a".into(), Modifier::Main, "a".into())
@@ -434,16 +444,14 @@ mod tests {
         assert_eq!(l.lines[0].pos[boundary], (1, 2));
 
         for modifier in [Modifier::Main, Modifier::Ctrl, Modifier::Shift, Modifier::Alt] {
-            let mut hint = overlay(Mode::Hint, &l, &cfg("{}"));
-            hint.set_view(0, 2);
+            let mut hint = overlay(Mode::Hint, &l, &cfg("{}"), (0, 2));
             assert_eq!(hint.marks().labels.len(), 1);
             assert!(hint.marks().highlight.contains(&(1, 2)));
             assert!(!hint.marks().highlight.contains(&(1, 1)));
             assert_eq!(pick(hint.step(Key::Char('a', modifier))).0, expected);
         }
         for query in ["seventh", "sixth-segment/seventh"] {
-            let mut flash = overlay(Mode::Flash, &l, &cfg("{}"));
-            flash.set_view(0, 2);
+            let mut flash = overlay(Mode::Flash, &l, &cfg("{}"), (0, 2));
             for ch in query.chars() {
                 assert!(matches!(flash.step(Key::Char(ch, Modifier::Main)), Step::Continue));
             }
@@ -454,7 +462,7 @@ mod tests {
     #[test]
     fn hint_uppercase_label_is_a_shift_pick() {
         let l = loaded("see https://example.com/a ok\n\n\n");
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         assert_eq!(pick(o.step(Key::Char('A', Modifier::Shift))).1, Modifier::Shift);
     }
 
@@ -464,7 +472,7 @@ mod tests {
     #[test]
     fn hint_two_letter_label_needs_both_keys() {
         let l = loaded(SIX_PATHS);
-        let mut o = overlay(Mode::Hint, &l, &cfg(r#"{"alphabet":"abc"}"#));
+        let mut o = overlay(Mode::Hint, &l, &cfg(r#"{"alphabet":"abc"}"#), (0, usize::MAX));
         assert!(matches!(o.step(Key::Char('b', Modifier::Main)), Step::Continue));
         assert_eq!(pick(o.step(Key::Char('a', Modifier::Main))), ("c/d2".into(), Modifier::Main, "ba".into()));
     }
@@ -472,7 +480,7 @@ mod tests {
     #[test]
     fn hint_q_and_escape_cancel() {
         let l = loaded("x\n\n\n");
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         assert!(matches!(o.step(Key::Char('q', Modifier::Main)), Step::Cancel));
         assert!(matches!(o.step(Key::Cancel), Step::Cancel));
     }
@@ -480,7 +488,7 @@ mod tests {
     #[test]
     fn hint_hides_labels_that_do_not_start_with_the_typed_prefix() {
         let l = loaded(SIX_PATHS);
-        let mut o = overlay(Mode::Hint, &l, &cfg(r#"{"alphabet":"abc"}"#));
+        let mut o = overlay(Mode::Hint, &l, &cfg(r#"{"alphabet":"abc"}"#), (0, usize::MAX));
         let before = o.marks().labels.len();
         o.step(Key::Char('b', Modifier::Main));
         // Before: 1 cell for "a" and 2 cells for each of the 5 other labels. After "b": the last letter of ba, bb, bc.
@@ -490,7 +498,7 @@ mod tests {
     #[test]
     fn flash_query_then_label_picks_the_whole_match() {
         let l = loaded("open https://example.com/a now\n\n\n");
-        let mut o = overlay(Mode::Flash, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Flash, &l, &cfg("{}"), (0, usize::MAX));
         for c in "exa".chars() {
             assert!(matches!(o.step(Key::Char(c, Modifier::Main)), Step::Continue));
         }
@@ -504,7 +512,7 @@ mod tests {
     fn flash_label_never_equals_the_next_character() {
         // "exa" is followed by 'm', so typing 'm' extends the query instead of picking.
         let l = loaded("open https://example.com/a now\n\n\n");
-        let mut o = overlay(Mode::Flash, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Flash, &l, &cfg("{}"), (0, usize::MAX));
         for c in "exa".chars() {
             o.step(Key::Char(c, Modifier::Main));
         }
@@ -515,7 +523,7 @@ mod tests {
     #[test]
     fn flash_enter_picks_only_a_single_hit() {
         let l = loaded("one two\n\n\n");
-        let mut o = overlay(Mode::Flash, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Flash, &l, &cfg("{}"), (0, usize::MAX));
         o.step(Key::Char('o', Modifier::Main));
         assert!(matches!(o.step(Key::Enter), Step::Continue));
         o.step(Key::Char('n', Modifier::Main));
@@ -543,7 +551,7 @@ mod tests {
     #[test]
     fn hint_labels_only_the_matches_in_view() {
         let l = with_scrollback();
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         o.set_view(3, 2);
         let rows: std::collections::BTreeSet<usize> = o.marks().labels.keys().map(|c| c.0).collect();
         assert_eq!(rows, [3, 4].into());
@@ -553,10 +561,10 @@ mod tests {
     }
 
     #[test]
-    fn hint_labels_restart_when_the_view_changes() {
+    fn initial_hint_view_excludes_history_and_labels_restart_when_scrolled() {
         let l = with_scrollback();
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
-        o.set_view(3, 2);
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (3, 2));
+        assert!(o.marks().labels.keys().all(|&(row, _)| row >= 3));
         // "p/d4" is the first match in view, so it has the first label.
         assert_eq!(pick(o.step(Key::Char('a', Modifier::Main))).0, "p/d4");
         o.set_view(0, 2);
@@ -566,7 +574,7 @@ mod tests {
     #[test]
     fn flash_finds_only_the_matches_in_view() {
         let l = with_scrollback();
-        let mut o = overlay(Mode::Flash, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Flash, &l, &cfg("{}"), (0, usize::MAX));
         o.set_view(3, 2);
         o.step(Key::Char('p', Modifier::Main));
         assert_eq!(o.marks().highlight.len(), 2);
@@ -596,7 +604,7 @@ mod tests {
     fn hint_picks_the_osc8_destination_with_each_modifier() {
         let l = loaded("see \x1b]8;;https://example.com/hidden\x07仕様書\x1b]8;;\x07\n\n\n");
         for (key, modifier) in [('a', Modifier::Main), ('A', Modifier::Shift), ('a', Modifier::Ctrl), ('a', Modifier::Alt)] {
-            let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+            let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
             let Step::Pick(p) = o.step(Key::Char(key, modifier)) else { panic!("expected a pick") };
             assert_eq!(p.text, "https://example.com/hidden");
             assert_eq!(p.modifier, modifier);
@@ -607,7 +615,7 @@ mod tests {
     #[test]
     fn hint_distinguishes_identical_link_text_with_different_destinations() {
         let l = loaded("\x1b]8;;https://one\x07docs\x1b]8;;\x07 \x1b]8;;https://two\x07docs\x1b]8;;\x07\n\n\n");
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         assert_eq!(pick(o.step(Key::Char('a', Modifier::Main))).0, "https://one");
         assert_eq!(pick(o.step(Key::Char('s', Modifier::Main))).0, "https://two");
     }
@@ -615,7 +623,7 @@ mod tests {
     #[test]
     fn hint_reuses_the_same_label_for_repeated_destinations() {
         let l = loaded("\x1b]8;;https://same\x07one\x1b]8;;\x07 \x1b]8;;https://same\x07two\x1b]8;;\x07\n\n\n");
-        let o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         assert_eq!(o.marks().labels.len(), 2);
         assert!(o.marks().labels.values().all(|&c| c == 'a'));
     }
@@ -624,7 +632,7 @@ mod tests {
     fn flash_searches_visible_osc8_text_and_picks_its_destination() {
         let l = loaded("see \x1b]8;;https://example.com/hidden\x07仕様書\x1b]8;;\x07\n\n\n");
         assert!(flash::search(&l.lines, "hidden").is_empty());
-        let mut o = overlay(Mode::Flash, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Flash, &l, &cfg("{}"), (0, usize::MAX));
         for c in "仕様".chars() {
             assert!(matches!(o.step(Key::Char(c, Modifier::Main)), Step::Continue));
         }
@@ -639,7 +647,7 @@ mod tests {
         let l = Loaded::new(vt, 80, 2, 1, &patterns::build(None, &[]).unwrap());
         assert_eq!((l.screen.rows.len(), l.live_top, l.found.len()), (3, 1, 3));
         assert!(l.found.iter().all(|f| f.is_uri && f.text == "https://example.com/history"));
-        let mut o = overlay(Mode::Hint, &l, &cfg("{}"));
+        let mut o = overlay(Mode::Hint, &l, &cfg("{}"), (0, usize::MAX));
         o.set_view(l.live_top, 2);
         assert_eq!(pick(o.step(Key::Char('a', Modifier::Main))).0, "https://example.com/history");
     }

@@ -15,7 +15,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Finds the `rex` command. A process that Rex starts from Lua can have a short PATH without it, so
-/// look in this order: REX_BIN, PATH, REX_BIN_DIR (which Rex exports), the app bundle in HOME.
+/// look in this order: REX_BIN, PATH, REX_BIN_DIR (which Rex exports), ~/.local/bin, the app bundle.
 /// When nothing is found it returns plain "rex" and the OS reports the error.
 fn resolve(
     rex_bin: Option<OsString>,
@@ -28,7 +28,11 @@ fn resolve(
     }
     let mut dirs: Vec<PathBuf> = path.iter().flat_map(std::env::split_paths).collect();
     dirs.extend(bin_dir.map(PathBuf::from));
-    dirs.extend(home.map(|h| PathBuf::from(h).join(APP_BIN_DIR)));
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(APP_BIN_DIR));
+    }
     dirs.into_iter()
         .map(|d| d.join("rex"))
         .find(|c| is_executable(c))
@@ -68,6 +72,18 @@ fn run(what: &str, args: &[&str]) -> Result<String, String> {
 }
 
 impl Target {
+    pub fn split(&self, cwd: &Path, command: &[String]) -> Result<Target, String> {
+        let cwd = cwd.to_str().ok_or("rex split: working directory is not UTF-8")?;
+        let mut args = vec!["split", "-s", &self.session, "-b", &self.block,
+            "--split=left", "--focus=false", "--shell=none", "-c", cwd, "--json", "--"];
+        args.extend(command.iter().map(String::as_str));
+        let output = run("split", &args)?;
+        let created: Value = serde_json::from_str(&output).map_err(|e| format!("rex split: {e}"))?;
+        let block = created["block_ids"][0].as_str().filter(|id| !id.is_empty())
+            .ok_or("rex split: no pane ID in reply")?;
+        Ok(Target { session: self.session.clone(), block: block.to_owned() })
+    }
+
     /// The screen and scrollback of the pane, with colours. Wrapped rows are joined, so a newline
     /// always ends a line that the program wrote.
     pub fn capture_vt(&self) -> Result<String, String> {
@@ -128,6 +144,16 @@ mod tests {
         let on_path = dir_with_rex("explicit", true);
         let got = resolve(Some("/opt/my/rex".into()), Some(on_path.into()), None, None);
         assert_eq!(got, PathBuf::from("/opt/my/rex"));
+    }
+
+    #[test]
+    fn local_bin_is_used_with_a_short_path() {
+        let home = dir_with_rex("local-bin", false);
+        let local = home.join(".local/bin");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join("rex"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(local.join("rex"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve(None, None, None, Some(home.into())), local.join("rex"));
     }
 
     #[test]
