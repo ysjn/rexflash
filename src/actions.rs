@@ -21,7 +21,7 @@ pub fn perform(
     copy(text)?;
     match cfg.action(modifier) {
         "" | ":copy:" => Ok(None),
-        ":paste:" => target.write(text).map(|_| None),
+        ":paste:" => target.paste(text).map(|_| None),
         ":open:" => match cfg.nvim.as_deref() {
             Some(nvim) => crate::open::selection(text, target, cwd, nvim),
             None => open(text, cwd, is_uri).map(|_| None),

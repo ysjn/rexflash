@@ -71,6 +71,24 @@ fn run(what: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+fn paste_input(text: &str, bracketed: bool, codex_screen: &str) -> Result<String, String> {
+    if text.contains('\x1b') {
+        return Err("paste: selection contains an escape character".into());
+    }
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    let normal = codex_screen.lines().rfind(|line| !line.trim().is_empty())
+        .and_then(|footer| footer.rsplit_once("Vim: "))
+        .is_some_and(|(_, mode)| mode.split_whitespace().next() == Some("Normal"));
+    let insert = if normal { "i" } else { "" };
+    Ok(if bracketed {
+        format!("{insert}\x1b[200~{text}\x1b[201~")
+    } else {
+        format!("{insert}{text}")
+    })
+}
+
 impl Target {
     pub fn split(&self, cwd: &Path, command: &[String]) -> Result<Target, String> {
         let cwd = cwd.to_str().ok_or("rex split: working directory is not UTF-8")?;
@@ -105,11 +123,28 @@ impl Target {
         Ok(Size { columns: field("columns")?, rows: field("rows")? })
     }
 
-    /// Types `data` into the pane as if the user had typed it.
-    pub fn write(&self, data: &str) -> Result<(), String> {
+    /// Paste literal text, entering Insert first when the foreground Codex footer reports Normal.
+    pub fn paste(&self, text: &str) -> Result<(), String> {
+        let metadata = |method: &str| -> Result<Value, String> {
+            let out = run(method, &["block", "call", "-s", &self.session, "-b", &self.block, method])?;
+            serde_json::from_str(&out).map_err(|e| format!("rex {method}: {e}"))
+        };
+        let modes = metadata("modes")?;
+        let bracketed = modes["modes"].as_array()
+            .and_then(|modes| modes.iter().find(|mode| mode["name"] == "bracketed_paste"))
+            .and_then(|mode| mode["set"].as_bool())
+            .ok_or("rex modes: no bracketed paste state in reply")?;
+        let process = metadata("process")?;
+        // shortcut: Recognize foreground Codex's visible footer; add adapters when other TUIs expose their mode.
+        let screen = if process["foreground"]["name"].as_str() == Some("codex") {
+            run("capture", &["capture", "-s", &self.session, "-b", &self.block, "--trim"])?
+        } else {
+            String::new()
+        };
+        let data = paste_input(text, bracketed, &screen)?;
         let args = json!({ "data": data }).to_string();
         run(
-            "write",
+            "paste",
             &["block", "call", "-s", &self.session, "-b", &self.block, "write", &args],
         )
         .map(|_| ())
@@ -125,6 +160,29 @@ impl Target {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn paste_keeps_the_whole_text_and_enters_insert_only_for_a_normal_footer() {
+        let text = "zzzi-alpha\n日本語";
+        for (screen, insert) in [
+            ("› draft\n? for shortcuts · Vim: Normal · ⚠ 3 warnings\n\n", "i"),
+            ("› draft\n? for shortcuts · Vim: Insert · ⚠ 3 warnings\n", ""),
+            ("› Vim: Normal\nmodel · directory\n? for shortcuts\n", ""),
+            ("Vim: Normality\n", ""),
+            ("", ""),
+        ] {
+            assert_eq!(paste_input(text, true, screen).unwrap(), format!("{insert}\x1b[200~{text}\x1b[201~"));
+            assert_eq!(paste_input(text, false, screen).unwrap(), format!("{insert}{text}"));
+        }
+    }
+
+    #[test]
+    fn paste_rejects_escape_sequences_and_leaves_empty_pastes_empty() {
+        for bracketed in [true, false] {
+            assert!(paste_input("text\x1b[201~i", bracketed, "Vim: Normal").is_err());
+            assert_eq!(paste_input("", bracketed, "Vim: Normal").unwrap(), "");
+        }
+    }
 
     /// A new empty directory, optionally holding an executable `rex`.
     fn dir_with_rex(name: &str, executable: bool) -> PathBuf {
