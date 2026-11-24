@@ -76,7 +76,7 @@ impl Loaded {
             Screen::parse(tail_lines(vt, keep + 1), cols).tail(keep)
         };
         let live_top = screen.rows.len().saturating_sub(pane_rows);
-        let lines = screen.lines();
+        let lines = patterns::join_wrapped_urls(patterns, screen.lines(), cols);
         let found = patterns::find_all(patterns, &lines);
         Loaded { screen, lines, found, live_top }
     }
@@ -427,6 +427,36 @@ mod tests {
             pick(o.step(Key::Char('a', Modifier::Main))),
             ("https://example.com/a".into(), Modifier::Main, "a".into())
         );
+    }
+
+    #[test]
+    fn codex_wrapped_url_is_one_target_in_hint_and_flash() {
+        let vt = concat!(
+            "  https://example.com/rexflash/wrapped-url/first-segment/second-segment/third-segment/fourth-segment/fifth-segment/sixth-segment\r\n",
+            "  /seventh-segment/eighth-segment?view=details&lang=ja\n",
+        );
+        let expected = "https://example.com/rexflash/wrapped-url/first-segment/second-segment/third-segment/fourth-segment/fifth-segment/sixth-segment/seventh-segment/eighth-segment?view=details&lang=ja";
+        let l = Loaded::new(vt, 128, 2, 0, &patterns::build(None, &[]).unwrap());
+        assert_eq!(l.found.len(), 1);
+        assert_eq!(l.found[0].text, expected);
+        assert_eq!((l.screen.rows.len(), l.live_top), (2, 0));
+        let boundary = l.lines[0].char_index(l.lines[0].text.find("/seventh").unwrap());
+        assert_eq!(l.lines[0].pos[boundary], (1, 2));
+
+        for modifier in [Modifier::Main, Modifier::Ctrl, Modifier::Shift, Modifier::Alt] {
+            let mut hint = overlay(Mode::Hint, &l, &cfg("{}"), (0, 2));
+            assert_eq!(hint.marks().labels.len(), 1);
+            assert!(hint.marks().highlight.contains(&(1, 2)));
+            assert!(!hint.marks().highlight.contains(&(1, 1)));
+            assert_eq!(pick(hint.step(Key::Char('a', modifier))).0, expected);
+        }
+        for query in ["seventh", "sixth-segment/seventh"] {
+            let mut flash = overlay(Mode::Flash, &l, &cfg("{}"), (0, 2));
+            for ch in query.chars() {
+                assert!(matches!(flash.step(Key::Char(ch, Modifier::Main)), Step::Continue));
+            }
+            assert_eq!(pick(flash.step(Key::Enter)).0, expected);
+        }
     }
 
     #[test]
